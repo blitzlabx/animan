@@ -29,6 +29,7 @@ export interface BlitzUser {
   created_at: number;
   notes: string | null;
   favorites?: string;
+  history?: string;
   search_count?: number;
   is_premium?: number;
 }

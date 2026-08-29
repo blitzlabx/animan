@@ -15,7 +15,9 @@ COPY tsconfig.json ./
 COPY src ./src
 
 # Build TypeScript
-RUN npm install typescript --no-save && npx tsc && npm uninstall typescript
+RUN npm install typescript --no-save \
+ && npx tsc --pretty false \
+ && npm uninstall typescript
 
 # Data dir for SQLite
 RUN mkdir -p /app/data
