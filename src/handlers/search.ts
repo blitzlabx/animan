@@ -1,6 +1,9 @@
 /**
  * Search, pick, episode, stream handlers
  * Animan by Blitz (@blitzlabx)
+ *
+ * Callback data uses SHORT indexes only (Telegram 64-byte limit).
+ * Full IDs live in blitzSessions.
  */
 import { Bot, Context } from "grammy";
 import {
@@ -19,15 +22,20 @@ import {
   episodeKeyboard,
   languageKeyboard,
   mainMenuKeyboard,
-  seasonalKeyboard,
   qualityKeyboard,
 } from "../utils/keyboards";
 import { MSG, escapeMd } from "../utils/messages";
 import { logDownload, logSearch, pushHistory, addFavorite } from "../db/database";
 import { blitzSessions, blitzRateLimiter } from "../cache/memory";
 import { blitzLog } from "../logging/logger";
-import type { AnimeProviderKey, MangaProviderKey, ContentLanguage, SearchResultItem } from "../types";
+import type {
+  AnimeProviderKey,
+  MangaProviderKey,
+  ContentLanguage,
+  SearchResultItem,
+} from "../types";
 import { LIMITS } from "../constants";
+import { blitzUserFacingError } from "../utils/errors";
 
 export function registerSearchHandlers(bot: Bot) {
   // Provider selection
@@ -44,7 +52,7 @@ export function registerSearchHandlers(bot: Bot) {
     await ctx.answerCallbackQuery();
     if (provider === "multi") {
       await ctx.editMessageText(
-        `🔀 *Multi-provider anime search*\n\nSend the title\\. Animan will query multiple sources and rank results\\.`,
+        `🔀 *Multi\\-provider anime search*\n\nSend the title\\. Animan will query multiple sources and rank results\\.`,
         { parse_mode: "Markdown" }
       );
     } else {
@@ -54,7 +62,6 @@ export function registerSearchHandlers(bot: Bot) {
     }
   });
 
-  // Quick commands
   bot.command("anime", async (ctx) => {
     if (!ctx.from) return;
     if (!blitzRateLimiter.tryConsume(ctx.from.id, 2)) {
@@ -126,72 +133,58 @@ export function registerSearchHandlers(bot: Bot) {
     await doSearch(ctx, state.mode, state.provider, q);
   });
 
-  // Pick result
-  bot.callbackQuery(/^pick:(anime|manga):(\w+):(.+)$/, async (ctx) => {
+  // Pick result by index  r:0
+  bot.callbackQuery(/^r:(\d+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const type = ctx.match![1] as "anime" | "manga";
-    const provider = ctx.match![2];
-    const mediaId = decodeURIComponent(ctx.match![3]);
+    const idx = parseInt(ctx.match![1], 10);
+    const state = blitzSessions.get(ctx.from.id);
+    const results = state.lastResults;
+    if (!results?.[idx]) {
+      await ctx.answerCallbackQuery({ text: "Session expired — search again", show_alert: true });
+      return;
+    }
+    const item = results[idx];
+    const type = state.mode || "anime";
+    const provider = state.provider || "allmanga";
     await ctx.answerCallbackQuery({ text: "Loading…" });
 
     try {
-      pushHistory(ctx.from.id, `${type}:${provider}:${mediaId}`);
+      pushHistory(ctx.from.id, `${type}:${provider}:${item.id}`);
       if (type === "anime") {
-        const units = await getEpisodes(mediaId, provider as AnimeProviderKey);
+        const units = await getEpisodes(item.id, provider as AnimeProviderKey);
         if (!units.length) {
-          await ctx.editMessageText("No episodes found\\.", {
-            parse_mode: "Markdown",
-            reply_markup: mainMenuKeyboard(),
-          });
+          await safeEdit(ctx, "No episodes found\\.", mainMenuKeyboard());
           return;
         }
         blitzSessions.set(ctx.from.id, {
-          mode: "anime",
-          provider: provider as any,
-          selectedMediaId: mediaId,
+          selectedMediaId: item.id,
           lastUnits: units,
           page: 0,
         });
-        await ctx.editMessageText(MSG.episodesHeader(units.length), {
-          parse_mode: "Markdown",
-          reply_markup: episodeKeyboard(units, provider, 0),
-        });
+        await safeEdit(ctx, MSG.episodesHeader(units.length), episodeKeyboard(units, 0));
       } else {
-        const units = await getChapters(mediaId, provider as MangaProviderKey);
+        const units = await getChapters(item.id, provider as MangaProviderKey);
         if (!units.length) {
-          await ctx.editMessageText("No chapters found\\.", {
-            parse_mode: "Markdown",
-            reply_markup: mainMenuKeyboard(),
-          });
+          await safeEdit(ctx, "No chapters found\\.", mainMenuKeyboard());
           return;
         }
         blitzSessions.set(ctx.from.id, {
-          mode: "manga",
-          provider: provider as any,
-          selectedMediaId: mediaId,
+          selectedMediaId: item.id,
           lastUnits: units,
           page: 0,
         });
-        await ctx.editMessageText(MSG.chaptersHeader(units.length), {
-          parse_mode: "Markdown",
-          reply_markup: episodeKeyboard(units, provider, 0),
-        });
+        await safeEdit(ctx, MSG.chaptersHeader(units.length), episodeKeyboard(units, 0));
       }
     } catch (e) {
       blitzLog.error("pick failed", { err: String(e) });
-      await ctx.editMessageText(MSG.error, {
-        parse_mode: "Markdown",
-        reply_markup: mainMenuKeyboard(),
-      });
+      await safeEdit(ctx, blitzUserFacingError(e), mainMenuKeyboard());
     }
   });
 
-  // Results pagination
-  bot.callbackQuery(/^page:(anime|manga):(\w+):(\d+)$/, async (ctx) => {
+  // Results pagination  rp:1
+  bot.callbackQuery(/^rp:(\d+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const type = ctx.match![1] as "anime" | "manga";
-    const provider = ctx.match![2];
-    const page = parseInt(ctx.match![3], 10);
+    const page = parseInt(ctx.match![1], 10);
     const state = blitzSessions.get(ctx.from.id);
     const results = state.lastResults;
     if (!results?.length) {
@@ -201,19 +194,14 @@ export function registerSearchHandlers(bot: Bot) {
     await ctx.answerCallbackQuery();
     blitzSessions.set(ctx.from.id, { page });
     const text =
-      `${MSG.searching("").replace("…", "")}*Results*\n` +
-      `Provider: \`${provider}\` · page ${page + 1}\n\nSelect one:`;
-    await ctx.editMessageText(text, {
-      parse_mode: "Markdown",
-      reply_markup: resultsKeyboard(results, type, provider, page),
-    });
+      `🔍 *Results*\nProvider: \`${state.provider || "?"}\` · page ${page + 1}\n\nSelect one:`;
+    await safeEdit(ctx, text, resultsKeyboard(results, page));
   });
 
-  // Episode pagination
-  bot.callbackQuery(/^eppage:(\w+):(\d+)$/, async (ctx) => {
+  // Episode pagination  ep:1  (note: short form)
+  bot.callbackQuery(/^ep:(\d+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const provider = ctx.match![1];
-    const page = parseInt(ctx.match![2], 10);
+    const page = parseInt(ctx.match![1], 10);
     const state = blitzSessions.get(ctx.from.id);
     const units = state.lastUnits;
     if (!units?.length) {
@@ -225,63 +213,85 @@ export function registerSearchHandlers(bot: Bot) {
       state.mode === "manga"
         ? MSG.chaptersHeader(units.length)
         : MSG.episodesHeader(units.length);
-    await ctx.editMessageText(header + `\n_Page ${page + 1}_`, {
-      parse_mode: "Markdown",
-      reply_markup: episodeKeyboard(units, provider, page),
-    });
+    await safeEdit(ctx, header + `\n_Page ${page + 1}_`, episodeKeyboard(units, page));
   });
 
-  // Episode / chapter select
-  bot.callbackQuery(/^ep:(\w+):(.+)$/, async (ctx) => {
+  // Episode/chapter select by index  e:0
+  bot.callbackQuery(/^e:(\d+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const provider = ctx.match![1];
-    const unitId = decodeURIComponent(ctx.match![2]);
+    const idx = parseInt(ctx.match![1], 10);
+    const state = blitzSessions.get(ctx.from.id);
+    const units = state.lastUnits;
+    if (!units?.[idx]) {
+      await ctx.answerCallbackQuery({ text: "Session expired", show_alert: true });
+      return;
+    }
+    const unit = units[idx];
+    const provider = state.provider || "allmanga";
     await ctx.answerCallbackQuery();
 
     const animeProviders = ["allmanga", "gogoanime", "anikoto", "megaplay", "animeparadise"];
     if (animeProviders.includes(provider)) {
-      blitzSessions.set(ctx.from.id, { selectedUnitId: unitId });
-      await ctx.editMessageText(`🎞 Choose language for this episode:`, {
-        parse_mode: "Markdown",
-        reply_markup: languageKeyboard(unitId, provider),
-      });
+      blitzSessions.set(ctx.from.id, { selectedUnitId: unit.id });
+      await safeEdit(ctx, `🎞 *Ep ${unit.number}* — choose language:`, languageKeyboard());
     } else {
-      await resolveAndSendManga(ctx, provider, unitId);
+      blitzSessions.set(ctx.from.id, { selectedUnitId: unit.id });
+      await resolveAndSendManga(ctx, provider, unit.id, unit.number);
     }
   });
 
-  // Language → stream
-  bot.callbackQuery(/^lang:(\w+):(.+):(sub|dub|raw)$/, async (ctx) => {
+  // Language  lang:sub | lang:menu
+  bot.callbackQuery(/^lang:(sub|dub|raw|menu)$/, async (ctx) => {
     if (!ctx.from) return;
-    const provider = ctx.match![1];
-    const unitId = decodeURIComponent(ctx.match![2]);
-    const lang = ctx.match![3] as ContentLanguage;
+    const langOrMenu = ctx.match![1];
+    const state = blitzSessions.get(ctx.from.id);
+    if (langOrMenu === "menu") {
+      await ctx.answerCallbackQuery();
+      await safeEdit(ctx, `🎞 Choose language:`, languageKeyboard());
+      return;
+    }
+    const unitId = state.selectedUnitId;
+    const provider = state.provider || "allmanga";
+    if (!unitId) {
+      await ctx.answerCallbackQuery({ text: "Session expired", show_alert: true });
+      return;
+    }
     await ctx.answerCallbackQuery({ text: "Resolving stream…" });
-    await resolveAndSendAnime(ctx, provider, unitId, lang);
+    await resolveAndSendAnime(ctx, provider, unitId, langOrMenu as ContentLanguage);
   });
 
-  // Quality pick
-  bot.callbackQuery(/^quality:(\w+):(.+):(sub|dub|raw):(.+)$/, async (ctx) => {
+  // Quality  quality:720p
+  bot.callbackQuery(/^quality:(.+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const provider = ctx.match![1];
-    const unitId = decodeURIComponent(ctx.match![2]);
-    const lang = ctx.match![3] as ContentLanguage;
-    const quality = ctx.match![4];
+    const quality = ctx.match![1];
+    const state = blitzSessions.get(ctx.from.id);
+    const unitId = state.selectedUnitId;
+    const provider = state.provider || "allmanga";
+    const lang = (state.language || "sub") as ContentLanguage;
+    if (!unitId) {
+      await ctx.answerCallbackQuery({ text: "Session expired", show_alert: true });
+      return;
+    }
     await ctx.answerCallbackQuery({ text: `Getting ${quality}…` });
     await resolveAndSendAnime(ctx, provider, unitId, lang, quality);
   });
 
-  // Favorite
-  bot.callbackQuery(/^fav:(anime|manga):(\w+):(.+)$/, async (ctx) => {
+  // Favorite index  fav:0
+  bot.callbackQuery(/^fav:(\d+)$/, async (ctx) => {
     if (!ctx.from) return;
-    const mediaId = decodeURIComponent(ctx.match![3]);
-    const ok = addFavorite(ctx.from.id, mediaId);
+    const idx = parseInt(ctx.match![1], 10);
+    const state = blitzSessions.get(ctx.from.id);
+    const item = state.lastResults?.[idx];
+    if (!item) {
+      await ctx.answerCallbackQuery({ text: "Nothing to save" });
+      return;
+    }
+    const ok = addFavorite(ctx.from.id, item.id);
     await ctx.answerCallbackQuery({
       text: ok ? "Added to favorites ⭐" : "Already in favorites",
     });
   });
 
-  // Seasonal
   bot.callbackQuery(/^seasonal:(\w+):(\d+)$/, async (ctx) => {
     await ctx.answerCallbackQuery({ text: "Loading seasonal…" });
     const season = ctx.match![1];
@@ -296,17 +306,30 @@ export function registerSearchHandlers(bot: Bot) {
         text += `${i + 1}\\. *${escapeMd(it.title)}*\n`;
       });
       text += `\n_AniList · Animan by Blitz_`;
-      await ctx.editMessageText(text, {
-        parse_mode: "Markdown",
-        reply_markup: mainMenuKeyboard(),
-      });
+      await safeEdit(ctx, text, mainMenuKeyboard());
     } catch {
-      await ctx.editMessageText(MSG.error, {
-        parse_mode: "Markdown",
-        reply_markup: mainMenuKeyboard(),
-      });
+      await safeEdit(ctx, MSG.error, mainMenuKeyboard());
     }
   });
+}
+
+async function safeEdit(ctx: Context, text: string, reply_markup?: any) {
+  try {
+    await ctx.editMessageText(text, {
+      parse_mode: "Markdown",
+      reply_markup,
+      link_preview_options: { is_disabled: false },
+    });
+  } catch (e: any) {
+    const msg = String(e?.message || e);
+    if (msg.includes("message is not modified")) return;
+    // Fallback: send new message
+    try {
+      await ctx.reply(text, { parse_mode: "Markdown", reply_markup });
+    } catch (e2) {
+      blitzLog.error("safeEdit failed", { err: String(e2) });
+    }
+  }
 }
 
 async function doSearch(
@@ -345,17 +368,34 @@ async function doSearch(
       page: 0,
     });
 
+    // Preview first result with thumbnail if available
+    const top = results[0];
     const text =
       `🔍 *Results for* _${escapeMd(query)}_\n` +
-      `Provider: \`${provider}\` · ${results.length} found\n\n` +
+      `Provider: \`${provider}\` · *${results.length}* found\n\n` +
+      (top.year ? `Top: *${escapeMd(top.title)}* \\(${top.year}\\)\n\n` : `Top: *${escapeMd(top.title)}*\n\n`) +
       `Select one:`;
+
+    if (top.thumbnailUrl) {
+      try {
+        await ctx.replyWithPhoto(top.thumbnailUrl, {
+          caption: text,
+          parse_mode: "Markdown",
+          reply_markup: resultsKeyboard(results, 0),
+        });
+        return;
+      } catch (e) {
+        blitzLog.debug("thumbnail send failed, text only", { err: String(e) });
+      }
+    }
+
     await ctx.reply(text, {
       parse_mode: "Markdown",
-      reply_markup: resultsKeyboard(results, type, provider, 0),
+      reply_markup: resultsKeyboard(results, 0),
     });
   } catch (e) {
     blitzLog.error("search failed", { err: String(e), query, provider });
-    await ctx.reply(MSG.error, {
+    await ctx.reply(blitzUserFacingError(e), {
       parse_mode: "Markdown",
       reply_markup: mainMenuKeyboard(),
     });
@@ -369,98 +409,111 @@ async function resolveAndSendAnime(
   lang: ContentLanguage,
   preferredQuality?: string
 ) {
-  try {
-    const result = await resolveAnimeStream(
-      unitId,
-      provider as AnimeProviderKey,
-      lang
-    );
-    if (result.type !== "video" || !result.streams.length) {
-      await ctx.editMessageText("No stream found for this episode\\.", {
-        parse_mode: "Markdown",
-        reply_markup: mainMenuKeyboard(),
-      });
-      return;
-    }
-
-    let stream = result.streams[0];
-    if (preferredQuality) {
-      const match = result.streams.find((s) => s.quality === preferredQuality);
-      if (match) stream = match;
-    }
-
-    // If multiple qualities and none preferred, offer picker once
-    if (!preferredQuality && result.streams.length > 1) {
-      const qualities = [...new Set(result.streams.map((s) => s.quality))];
-      if (qualities.length > 1) {
-        await ctx.editMessageText(
-          `🎚 Multiple qualities available\\. Pick one:`,
-          {
-            parse_mode: "Markdown",
-            reply_markup: qualityKeyboard(unitId, provider, lang, qualities),
-          }
-        );
-        return;
-      }
-    }
-
-    if (ctx.from) {
-      logDownload(ctx.from.id, "anime", unitId, 0, provider);
-    }
-
-    await ctx.editMessageText(
-      MSG.streamReady(
-        stream.quality,
-        lang,
-        stream.isHLS,
-        stream.sourceUrl,
-        stream.subtitles
-      ),
-      {
-        parse_mode: "Markdown",
-        link_preview_options: { is_disabled: true },
-        reply_markup: mainMenuKeyboard(),
-      }
-    );
-  } catch (e) {
-    blitzLog.error("resolve anime failed", { err: String(e) });
-    await ctx.editMessageText(MSG.error, {
-      parse_mode: "Markdown",
-      reply_markup: mainMenuKeyboard(),
-    });
+  if (ctx.from) {
+    blitzSessions.set(ctx.from.id, { language: lang, selectedUnitId: unitId });
   }
+
+  const tryLangs: ContentLanguage[] = [lang];
+  for (const l of ["sub", "dub", "raw"] as ContentLanguage[]) {
+    if (!tryLangs.includes(l)) tryLangs.push(l);
+  }
+
+  let lastErr: unknown;
+  for (const tryLang of tryLangs) {
+    try {
+      const result = await resolveAnimeStream(
+        unitId,
+        provider as AnimeProviderKey,
+        tryLang
+      );
+      if (result.type !== "video" || !result.streams.length) {
+        lastErr = new Error(`No streams for ${tryLang}`);
+        continue;
+      }
+
+      let stream = result.streams[0];
+      if (preferredQuality) {
+        const match = result.streams.find((s) => s.quality === preferredQuality);
+        if (match) stream = match;
+      } else if (result.streams.length > 1 && !preferredQuality) {
+        const qualities = [...new Set(result.streams.map((s) => s.quality))];
+        if (qualities.length > 1) {
+          await safeEdit(
+            ctx,
+            `🎚 Multiple qualities \\(${tryLang}\\)\\. Pick one:`,
+            qualityKeyboard(qualities)
+          );
+          return;
+        }
+      }
+
+      if (ctx.from) {
+        logDownload(ctx.from.id, "anime", unitId, 0, provider);
+      }
+
+      await safeEdit(
+        ctx,
+        MSG.streamReady(
+          stream.quality,
+          tryLang,
+          stream.isHLS,
+          stream.sourceUrl,
+          stream.subtitles
+        ),
+        mainMenuKeyboard()
+      );
+      return;
+    } catch (e) {
+      lastErr = e;
+      blitzLog.warn("stream try failed", { tryLang, err: String(e) });
+    }
+  }
+
+  await safeEdit(
+    ctx,
+    `⚠️ Could not resolve a stream\\.\n${escapeMd(blitzUserFacingError(lastErr))}\n\nTry another episode, language, or provider\\.`,
+    mainMenuKeyboard()
+  );
 }
 
 async function resolveAndSendManga(
   ctx: Context,
   provider: string,
-  unitId: string
+  unitId: string,
+  unitNumber?: number
 ) {
   try {
     const result = await resolveMangaPages(unitId, provider as MangaProviderKey);
     if (result.type !== "manga" || !result.pages.imageUrls.length) {
-      await ctx.editMessageText("No pages found\\.", {
-        parse_mode: "Markdown",
-        reply_markup: mainMenuKeyboard(),
-      });
+      await safeEdit(ctx, "No pages found\\.", mainMenuKeyboard());
       return;
     }
 
     const pages = result.pages.imageUrls;
     if (ctx.from) {
-      logDownload(ctx.from.id, "manga", unitId, 0, provider);
+      logDownload(ctx.from.id, "manga", unitId, unitNumber || 0, provider);
     }
 
-    await ctx.editMessageText(MSG.mangaReady(pages.length, pages.slice(0, 3)), {
-      parse_mode: "Markdown",
-      link_preview_options: { is_disabled: true },
-      reply_markup: mainMenuKeyboard(),
-    });
+    // Send first page as preview image when possible
+    const caption = MSG.mangaReady(pages.length, pages.slice(0, 5));
+    try {
+      await ctx.replyWithPhoto(pages[0], {
+        caption: `📚 *Chapter${unitNumber != null ? ` ${unitNumber}` : ""}* · ${pages.length} pages\n\n` +
+          pages.slice(0, 5).map((u, i) => `${i + 1}\\. [Page ${i + 1}](${u})`).join("\n") +
+          (pages.length > 5 ? `\n\n_…and ${pages.length - 5} more_` : "") +
+          `\n\n_Animan by Blitz_`,
+        parse_mode: "Markdown",
+        reply_markup: mainMenuKeyboard(),
+      });
+      // delete the "loading" message if it was an edit target
+      try {
+        await ctx.deleteMessage();
+      } catch { /* ignore */ }
+    } catch {
+      await safeEdit(ctx, caption, mainMenuKeyboard());
+    }
   } catch (e) {
     blitzLog.error("resolve manga failed", { err: String(e) });
-    await ctx.editMessageText(MSG.error, {
-      parse_mode: "Markdown",
-      reply_markup: mainMenuKeyboard(),
-    });
+    await safeEdit(ctx, blitzUserFacingError(e), mainMenuKeyboard());
   }
 }
